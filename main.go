@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/mattn/go-runewidth"
 )
 
 // PaneInfo holds tmux pane metadata.
@@ -392,11 +394,20 @@ func classifyStatus(lines [][]byte) string {
 	return "idle"
 }
 
+// padRight pads s with spaces so its display width equals targetWidth.
+func padRight(s string, targetWidth int) string {
+	w := runewidth.StringWidth(s)
+	if w >= targetWidth {
+		return s
+	}
+	return s + strings.Repeat(" ", targetWidth-w)
+}
+
 // formatEntries builds fzf-compatible display strings.
 func formatEntries(instances []ClaudeInstance) []string {
 	now := time.Now()
 
-	// Compute column widths
+	// Compute column widths using display width (not byte length)
 	maxSession, maxStatus, maxAgo, maxElapsed := 0, 0, 0, 0
 
 	type formatted struct {
@@ -414,27 +425,30 @@ func formatEntries(instances []ClaudeInstance) []string {
 
 		rows[i] = formatted{inst.SessionName, inst.Status, ago, elapsed, ctx}
 
-		if len(inst.SessionName) > maxSession {
-			maxSession = len(inst.SessionName)
+		if w := runewidth.StringWidth(inst.SessionName); w > maxSession {
+			maxSession = w
 		}
-		if len(inst.Status) > maxStatus {
-			maxStatus = len(inst.Status)
+		if w := runewidth.StringWidth(inst.Status); w > maxStatus {
+			maxStatus = w
 		}
-		if len(ago) > maxAgo {
-			maxAgo = len(ago)
+		if w := runewidth.StringWidth(ago); w > maxAgo {
+			maxAgo = w
 		}
-		if len(elapsed) > maxElapsed {
-			maxElapsed = len(elapsed)
+		if w := runewidth.StringWidth(elapsed); w > maxElapsed {
+			maxElapsed = w
 		}
 	}
 
 	entries := make([]string, len(instances))
-	fmtStr := fmt.Sprintf("%%s\t  %%-%ds   %%-%ds   %%-%ds   %%-%ds  %%s",
-		maxSession, maxStatus, maxAgo, maxElapsed)
-
 	for i, inst := range instances {
 		r := rows[i]
-		entries[i] = fmt.Sprintf(fmtStr, inst.PaneTarget, r.session, r.status, r.ago, r.elapsed, r.context)
+		entries[i] = fmt.Sprintf("%s\t  %s   %s   %s   %s  %s",
+			inst.PaneTarget,
+			padRight(r.session, maxSession),
+			padRight(r.status, maxStatus),
+			padRight(r.ago, maxAgo),
+			padRight(r.elapsed, maxElapsed),
+			r.context)
 	}
 	return entries
 }
