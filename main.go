@@ -372,6 +372,11 @@ func classifyStatus(lines [][]byte) string {
 			}
 			return "working"
 		case "user":
+			// An interrupted request writes a user entry with this marker text.
+			// The session is back at the prompt, so treat it as idle.
+			if bytes.Contains(entry.Message, []byte("Request interrupted by user")) {
+				return "idle"
+			}
 			return "working"
 		case "progress":
 			if entry.Data.Type == "hook_progress" {
