@@ -39,7 +39,7 @@ type ClaudeInstance struct {
 	SessionName  string
 	LastAttached int64
 	InNvim       bool
-	Status       string // "working", "idle", "?"
+	Status       string // "working", "idle", "waiting", "?"
 }
 
 func main() {
@@ -245,7 +245,7 @@ func detectStatus(sessionID, cwd string) string {
 	encodedPath := strings.ReplaceAll(cwd, "/", "-")
 	jsonlPath := filepath.Join(home, ".claude", "projects", encodedPath, sessionID+".jsonl")
 
-	tailData, err := readFileTail(jsonlPath, 8192)
+	tailData, err := readFileTail(jsonlPath, 65536)
 	if err != nil {
 		return "?"
 	}
@@ -319,8 +319,13 @@ func classifyStatus(tailData []byte) string {
 					StopReason *string `json:"stop_reason"`
 				}
 				json.Unmarshal(entry.Message, &msg)
-				if msg.StopReason != nil && *msg.StopReason == "end_turn" {
-					return "idle"
+				if msg.StopReason != nil {
+					switch *msg.StopReason {
+					case "end_turn":
+						return "idle"
+					case "tool_use":
+						return "waiting"
+					}
 				}
 			}
 			return "working"
