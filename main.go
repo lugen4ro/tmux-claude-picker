@@ -245,16 +245,19 @@ func detectStatus(sessionID, cwd string) string {
 	encodedPath := strings.ReplaceAll(cwd, "/", "-")
 	jsonlPath := filepath.Join(home, ".claude", "projects", encodedPath, sessionID+".jsonl")
 
-	tailData, err := readFileTail(jsonlPath, 65536)
+	lines, err := readLastLines(jsonlPath, 20)
 	if err != nil {
-		return "?"
+		// File doesn't exist yet (brand new session) → waiting for user input
+		return "idle"
 	}
 
-	return classifyStatus(tailData)
+	return classifyStatus(lines)
 }
 
-// readFileTail reads the last n bytes of a file.
-func readFileTail(path string, n int64) ([]byte, error) {
+// readLastLines reads the last n complete lines from a file by scanning
+// backward from the end. This handles arbitrarily long lines (e.g. large
+// tool results) without needing to guess a byte budget.
+func readLastLines(path string, n int) ([][]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -267,31 +270,70 @@ func readFileTail(path string, n int64) ([]byte, error) {
 	}
 
 	size := fi.Size()
-	offset := int64(0)
-	if size > n {
-		offset = size - n
+	if size == 0 {
+		return nil, nil
 	}
 
-	buf := make([]byte, size-offset)
-	_, err = f.ReadAt(buf, offset)
-	if err != nil && err != io.EOF {
-		return nil, err
+	// Scan backward collecting newline positions
+	const chunkSize = 4096
+	var newlines []int64 // positions of '\n' characters
+	pos := size
+
+	for pos > 0 && len(newlines) <= n {
+		readSize := int64(chunkSize)
+		if readSize > pos {
+			readSize = pos
+		}
+		pos -= readSize
+
+		buf := make([]byte, readSize)
+		_, err := f.ReadAt(buf, pos)
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+
+		for i := len(buf) - 1; i >= 0; i-- {
+			if buf[i] == '\n' {
+				newlines = append(newlines, pos+int64(i))
+			}
+		}
 	}
-	return buf, nil
+
+	// Determine start positions for each line
+	// newlines are in reverse order (from end of file backward)
+	var lines [][]byte
+	end := size
+	for _, nlPos := range newlines {
+		lineStart := nlPos + 1
+		if lineStart >= end {
+			end = nlPos
+			continue // empty line
+		}
+		lineBuf := make([]byte, end-lineStart)
+		f.ReadAt(lineBuf, lineStart)
+		lines = append(lines, bytes.TrimSpace(lineBuf))
+		end = nlPos
+		if len(lines) >= n {
+			break
+		}
+	}
+
+	// If we reached the start of the file, include the first line
+	if end > 0 && len(lines) < n {
+		lineBuf := make([]byte, end)
+		f.ReadAt(lineBuf, 0)
+		lines = append(lines, bytes.TrimSpace(lineBuf))
+	}
+
+	return lines, nil
 }
 
-// classifyStatus parses JSONL tail data and determines the session state.
-func classifyStatus(tailData []byte) string {
-	lines := bytes.Split(tailData, []byte("\n"))
-
-	// If we seeked into the middle, first line is likely partial — skip it
-	if len(lines) > 1 {
-		lines = lines[1:]
-	}
-
-	// Scan backward through valid JSON lines
-	for i := len(lines) - 1; i >= 0 && i >= len(lines)-15; i-- {
-		line := bytes.TrimSpace(lines[i])
+// classifyStatus parses JSONL lines (in reverse order, newest first) and
+// determines the session state.
+func classifyStatus(lines [][]byte) string {
+	// Lines are already in reverse order (newest first)
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
 		if len(line) == 0 {
 			continue
 		}
@@ -340,7 +382,9 @@ func classifyStatus(tailData []byte) string {
 			continue // metadata, keep scanning
 		}
 	}
-	return "?"
+	// No recognizable state entries found (e.g. brand new session with only
+	// metadata lines, or empty file) → treat as idle since it's awaiting input.
+	return "idle"
 }
 
 // formatEntries builds fzf-compatible display strings.
