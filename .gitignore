@@ -1,0 +1,6 @@
+# Claude
+**/.claude/**/*.local.*
+**/CLAUDE.local.md
+
+# Compiled binary
+bin/tmux-claude-picker
