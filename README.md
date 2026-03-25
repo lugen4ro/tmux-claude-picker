@@ -4,7 +4,6 @@ A tmux plugin for managing multiple Claude Code sessions. If you run Claude Code
 
 Built on [fzf-tmux](https://github.com/junegunn/fzf#fzf-tmux).
 
-![screenshot](https://github.com/user-attachments/assets/placeholder.png)
 
 <img width="2606" height="1461" alt="CleanShot2026-03-25at13 20 12" src="https://github.com/user-attachments/assets/08110d13-a53e-4b07-a2a3-be60b1041322" />
 
