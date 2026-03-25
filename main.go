@@ -1,3 +1,94 @@
+// Package main implements tmux-claude-picker, a tmux plugin that discovers all
+// running Claude Code sessions across tmux panes and presents them in an
+// interactive fzf picker for quick switching.
+//
+// # How it works
+//
+// The picker correlates three data sources to build its list:
+//
+//  1. Claude Code session files (~/.claude/sessions/*.json)
+//  2. The OS process tree (via ps)
+//  3. Tmux pane metadata (via tmux list-panes)
+//
+// For each Claude session file, it verifies the PID is alive, walks up the
+// process tree to find the owning tmux pane, detects whether the session is
+// running inside neovim, and reads the JSONL conversation log to determine
+// the session's current status (idle, working, waiting for tool approval).
+//
+// # Claude Code session files
+//
+// Claude Code writes a JSON file per running instance at:
+//
+//	~/.claude/sessions/{PID}.json
+//
+// Each file contains:
+//
+//	{
+//	  "pid": 12345,              // OS process ID of the Claude Code process
+//	  "sessionId": "uuid-...",   // Unique session identifier
+//	  "cwd": "/Users/foo/proj",  // Working directory where Claude was started
+//	  "startedAt": 1711234567890 // Unix timestamp in milliseconds
+//	}
+//
+// These files may persist after the process exits (stale), so we validate
+// each PID against the live process tree before using it.
+//
+// # Claude Code conversation logs (JSONL)
+//
+// Each session's conversation is logged as newline-delimited JSON at:
+//
+//	~/.claude/projects/{encoded-cwd}/{sessionId}.jsonl
+//
+// Where {encoded-cwd} is the working directory with "/" replaced by "-",
+// e.g. "/Users/foo/bar" becomes "-Users-foo-bar".
+//
+// Each line is a JSON object with a "type" field. The types relevant to
+// status detection are:
+//
+//   - "user"      — A user message. Contains a "message" object with "role"
+//     and "content". When the user interrupts a response, a
+//     special entry is written with content containing
+//     "[Request interrupted by user]".
+//
+//   - "assistant" — An assistant response. Contains a "message" object with
+//     an optional "stop_reason" field:
+//     "end_turn"  = finished responding (idle)
+//     "tool_use"  = wants to run a tool, awaiting approval (waiting)
+//     nil/absent  = still streaming (working)
+//
+//   - "system"    — System metadata. The "subtype" field distinguishes:
+//     "turn_duration"    = marks the end of a turn (idle)
+//     "stop_hook_summary" = hook execution finished (idle)
+//
+//   - "progress"  — Progress updates during tool execution. The "data.type"
+//     field may be "hook_progress" (which we skip past) or
+//     other values indicating active work.
+//
+//   - "file-history-snapshot", "queue-operation" — Internal bookkeeping
+//     entries that don't indicate session state; skipped during scanning.
+//
+// We read the last ~20 lines and scan newest-first to determine the current
+// state as one of: "idle", "working", or "waiting".
+//
+// # Process tree walking
+//
+// Claude Code runs as a Node.js process, which may be a child of a shell,
+// which may be a child of nvim (if using a terminal plugin), which is
+// ultimately a child of the tmux pane's initial process. We walk up the
+// process tree from the Claude PID until we find a PID that matches a tmux
+// pane. Along the way, we check if any ancestor is nvim to annotate the
+// entry with [nvim].
+//
+// # Display format
+//
+// Entries are formatted as tab-separated lines for fzf:
+//
+//	{pane_target}\t  {session_name}   {status}   {last_attached}   {elapsed}  {context}
+//
+// The pane_target (e.g. "mysession:0.1") is hidden from display via fzf's
+// --with-nth=2.. but used as the switch target when selected. Column widths
+// are computed using Unicode display width (via go-runewidth) to correctly
+// align entries containing emojis or CJK characters.
 package main
 
 import (
@@ -16,67 +107,79 @@ import (
 	"github.com/mattn/go-runewidth"
 )
 
-// PaneInfo holds tmux pane metadata.
+// PaneInfo holds metadata for a single tmux pane, extracted from the output
+// of "tmux list-panes -a". The Target field uses tmux's standard addressing
+// format "session_name:window_index.pane_index".
 type PaneInfo struct {
-	Target       string // "session:window.pane"
-	Session      string
-	LastAttached int64 // unix timestamp
+	Target       string // e.g. "mysession:0.1"
+	Session      string // e.g. "mysession"
+	LastAttached int64  // unix timestamp of the session's last client attachment
 }
 
-// SessionJSON is the structure of ~/.claude/sessions/{PID}.json.
+// SessionJSON represents the contents of a Claude Code session file at
+// ~/.claude/sessions/{PID}.json. See package doc for the full format.
 type SessionJSON struct {
-	PID       int    `json:"pid"`
-	SessionID string `json:"sessionId"`
-	CWD       string `json:"cwd"`
-	StartedAt int64  `json:"startedAt"` // unix millis
+	PID       int    `json:"pid"`       // OS process ID of the Claude Code process
+	SessionID string `json:"sessionId"` // UUID identifying the conversation session
+	CWD       string `json:"cwd"`       // Working directory where Claude Code was launched
+	StartedAt int64  `json:"startedAt"` // Session start time as Unix milliseconds
 }
 
-// ClaudeInstance is a discovered Claude session mapped to a tmux pane.
+// ClaudeInstance represents a fully resolved Claude Code session: a session
+// file that has been validated against the process tree, mapped to a tmux
+// pane, and had its status detected from the conversation log.
 type ClaudeInstance struct {
 	PID          int
 	SessionID    string
 	CWD          string
 	StartedAt    time.Time
-	PaneTarget   string
-	SessionName  string
-	LastAttached int64
-	InNvim       bool
-	Status       string // "working", "idle", "waiting", "?"
+	PaneTarget   string // tmux target for switching, e.g. "mysession:0.1"
+	SessionName  string // tmux session name for display
+	LastAttached int64  // for sorting: most recently attached first
+	InNvim       bool   // true if Claude is running inside a neovim terminal
+	Status       string // "working", "idle", or "waiting"
 }
 
 func main() {
+	// Step 1: Build a lookup from tmux pane PIDs to pane metadata.
 	paneLookup, err := buildPaneLookup()
 	if err != nil {
 		tmuxMessage("claude-picker:" + err.Error())
 		os.Exit(1)
 	}
 
+	// Step 2: Snapshot the entire OS process tree for parent/child walking.
 	parentOf, commOf, err := buildProcessTree()
 	if err != nil {
 		tmuxMessage("claude-picker:" + err.Error())
 		os.Exit(1)
 	}
 
+	// Step 3: Read all Claude Code session files.
 	sessions, err := readActiveSessions()
 	if err != nil || len(sessions) == 0 {
 		tmuxMessage("No Claude Code instances found")
 		return
 	}
 
+	// Step 4: For each session, validate it's alive and map it to a tmux pane.
 	seen := map[string]bool{}
 	var instances []ClaudeInstance
 
 	for _, s := range sessions {
-		// Verify PID is actually in the process tree (not stale)
+		// Skip stale session files whose PID no longer exists.
 		if _, ok := parentOf[s.PID]; !ok {
 			continue
 		}
 
+		// Walk up the process tree to find the tmux pane that owns this process.
 		panePID, found := walkToPane(s.PID, parentOf, paneLookup)
 		if !found {
 			continue
 		}
 
+		// Deduplicate: one entry per tmux pane even if multiple session files
+		// point to the same pane (can happen with stale files).
 		pane := paneLookup[panePID]
 		if seen[pane.Target] {
 			continue
@@ -102,16 +205,16 @@ func main() {
 		return
 	}
 
+	// Sort by most recently attached tmux session first.
 	sort.Slice(instances, func(i, j int) bool {
 		return instances[i].LastAttached > instances[j].LastAttached
 	})
 
 	entries := formatEntries(instances)
 
-	// Debug mode: just print entries and exit
+	// Debug mode: print entries to stdout instead of launching fzf.
 	if len(os.Args) > 1 && os.Args[1] == "--debug" {
 		for _, e := range entries {
-			// Replace tab with visible separator for debug
 			fmt.Println(strings.Replace(e, "\t", " | ", 1))
 		}
 		return
@@ -122,11 +225,19 @@ func main() {
 		return
 	}
 
+	// The pane target is the first tab-separated field.
 	target := strings.SplitN(selected, "\t", 2)[0]
 	exec.Command("tmux", "switch-client", "-t", target).Run()
 }
 
-// buildPaneLookup queries tmux for all panes and returns a map of pane_pid -> PaneInfo.
+// buildPaneLookup queries tmux for all panes across all sessions and returns
+// a map from each pane's shell PID to its metadata.
+//
+// It runs: tmux list-panes -a -F "#{pane_pid}|#{session_name}|#{window_index}|#{pane_index}|#{session_last_attached}"
+//
+// The output is pipe-delimited with one line per pane, e.g.:
+//
+//	12345|mysession|0|1|1711234567
 func buildPaneLookup() (map[int]PaneInfo, error) {
 	out, err := exec.Command("tmux", "list-panes", "-a", "-F",
 		"#{pane_pid}|#{session_name}|#{window_index}|#{pane_index}|#{session_last_attached}").Output()
@@ -151,7 +262,10 @@ func buildPaneLookup() (map[int]PaneInfo, error) {
 	return lookup, nil
 }
 
-// buildProcessTree runs a single ps command and returns parent/comm maps.
+// buildProcessTree snapshots the OS process tree by running "ps -axo pid,ppid,comm".
+// It returns two maps:
+//   - parentOf: maps each PID to its parent PID
+//   - commOf:   maps each PID to its command name (used for nvim detection)
 func buildProcessTree() (parentOf map[int]int, commOf map[int]string, err error) {
 	out, err := exec.Command("ps", "-axo", "pid,ppid,comm").Output()
 	if err != nil {
@@ -177,7 +291,10 @@ func buildProcessTree() (parentOf map[int]int, commOf map[int]string, err error)
 	return parentOf, commOf, nil
 }
 
-// readActiveSessions reads all ~/.claude/sessions/*.json files.
+// readActiveSessions reads all Claude Code session files from
+// ~/.claude/sessions/*.json and returns them as parsed structs.
+// Files that fail to read or parse are silently skipped (they may be
+// partially written or from an incompatible version).
 func readActiveSessions() ([]SessionJSON, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -204,7 +321,14 @@ func readActiveSessions() ([]SessionJSON, error) {
 	return sessions, nil
 }
 
-// walkToPane walks from pid up the process tree until it finds a tmux pane PID.
+// walkToPane walks from the given pid up the process tree (via parentOf)
+// until it finds a PID that is a tmux pane shell process (present in
+// paneLookup). Returns the pane PID and true if found, or (0, false) if the
+// walk reaches PID 1 or a broken chain without finding a pane.
+//
+// The typical chain looks like:
+//
+//	claude (node) → bash/zsh → [nvim → bash/zsh →] tmux-pane-shell
 func walkToPane(pid int, parentOf map[int]int, paneLookup map[int]PaneInfo) (int, bool) {
 	current := pid
 	for current > 1 {
@@ -220,7 +344,11 @@ func walkToPane(pid int, parentOf map[int]int, paneLookup map[int]PaneInfo) (int
 	return 0, false
 }
 
-// hasNvimAncestor checks if any process between pid and panePID is nvim.
+// hasNvimAncestor checks whether any process in the chain between pid
+// (exclusive) and panePID (exclusive) has "nvim" in its command name.
+// This is used to annotate picker entries with [nvim] so the user can
+// distinguish Claude sessions running in a neovim terminal buffer from
+// standalone ones.
 func hasNvimAncestor(pid, panePID int, parentOf map[int]int, commOf map[int]string) bool {
 	current := pid
 	for current != panePID && current > 1 {
@@ -236,20 +364,30 @@ func hasNvimAncestor(pid, panePID int, parentOf map[int]int, commOf map[int]stri
 	return false
 }
 
-// detectStatus reads the JSONL tail to determine Claude's current state.
+// detectStatus determines the current state of a Claude Code session by
+// reading the tail of its JSONL conversation log.
+//
+// The log path is derived from the session's working directory and ID:
+//
+//	~/.claude/projects/{encoded-cwd}/{sessionId}.jsonl
+//
+// Where {encoded-cwd} replaces all "/" with "-", e.g.:
+//
+//	cwd "/Users/foo/bar" → encoded "-Users-foo-bar"
+//
+// Returns "idle", "working", or "waiting".
 func detectStatus(sessionID, cwd string) string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "?"
+		return "idle"
 	}
 
-	// Encode path: /Users/foo/bar -> -Users-foo-bar
 	encodedPath := strings.ReplaceAll(cwd, "/", "-")
 	jsonlPath := filepath.Join(home, ".claude", "projects", encodedPath, sessionID+".jsonl")
 
 	lines, err := readLastLines(jsonlPath, 20)
 	if err != nil {
-		// File doesn't exist yet (brand new session) → waiting for user input
+		// File doesn't exist yet (brand new session) → waiting for user input.
 		return "idle"
 	}
 
@@ -257,8 +395,12 @@ func detectStatus(sessionID, cwd string) string {
 }
 
 // readLastLines reads the last n complete lines from a file by scanning
-// backward from the end. This handles arbitrarily long lines (e.g. large
-// tool results) without needing to guess a byte budget.
+// backward from the end in chunks. Lines are returned in reverse order
+// (newest first).
+//
+// This approach handles arbitrarily long lines (e.g. JSONL entries containing
+// large tool results or base64 images) without loading the entire file, since
+// we only need a small number of recent entries for status classification.
 func readLastLines(path string, n int) ([][]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -276,9 +418,9 @@ func readLastLines(path string, n int) ([][]byte, error) {
 		return nil, nil
 	}
 
-	// Scan backward collecting newline positions
+	// Scan backward in chunks, collecting newline byte positions.
 	const chunkSize = 4096
-	var newlines []int64 // positions of '\n' characters
+	var newlines []int64
 	pos := size
 
 	for pos > 0 && len(newlines) <= n {
@@ -301,8 +443,7 @@ func readLastLines(path string, n int) ([][]byte, error) {
 		}
 	}
 
-	// Determine start positions for each line
-	// newlines are in reverse order (from end of file backward)
+	// Extract lines between newline positions (newest first).
 	var lines [][]byte
 	end := size
 	for _, nlPos := range newlines {
@@ -320,7 +461,7 @@ func readLastLines(path string, n int) ([][]byte, error) {
 		}
 	}
 
-	// If we reached the start of the file, include the first line
+	// If we reached the start of the file, include the first line.
 	if end > 0 && len(lines) < n {
 		lineBuf := make([]byte, end)
 		f.ReadAt(lineBuf, 0)
@@ -330,10 +471,26 @@ func readLastLines(path string, n int) ([][]byte, error) {
 	return lines, nil
 }
 
-// classifyStatus parses JSONL lines (in reverse order, newest first) and
-// determines the session state.
+// classifyStatus examines JSONL entries (in reverse chronological order,
+// newest first) and returns the session's current state.
+//
+// The logic scans backward through entries looking for the first one that
+// definitively indicates a state:
+//
+//   - "idle": The assistant finished its turn (stop_reason="end_turn"),
+//     a system turn_duration/stop_hook_summary was logged, or the user
+//     interrupted the response.
+//
+//   - "waiting": The assistant emitted a tool_use stop_reason, meaning it
+//     wants to execute a tool and is waiting for user approval.
+//
+//   - "working": A user message was sent (Claude is processing), an
+//     assistant message is streaming (no stop_reason yet), or a non-hook
+//     progress event is active.
+//
+// Metadata-only entries (file-history-snapshot, queue-operation, hook_progress)
+// are skipped as they don't indicate conversational state.
 func classifyStatus(lines [][]byte) string {
-	// Lines are already in reverse order (newest first)
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
 		if len(line) == 0 {
@@ -341,8 +498,8 @@ func classifyStatus(lines [][]byte) string {
 		}
 
 		var entry struct {
-			Type    string `json:"type"`
-			Subtype string `json:"subtype"`
+			Type    string          `json:"type"`
+			Subtype string          `json:"subtype"`
 			Message json.RawMessage `json:"message"`
 			Data    struct {
 				Type string `json:"type"`
@@ -357,6 +514,7 @@ func classifyStatus(lines [][]byte) string {
 			if entry.Subtype == "turn_duration" || entry.Subtype == "stop_hook_summary" {
 				return "idle"
 			}
+
 		case "assistant":
 			if len(entry.Message) > 0 {
 				var msg struct {
@@ -373,28 +531,37 @@ func classifyStatus(lines [][]byte) string {
 				}
 			}
 			return "working"
+
 		case "user":
-			// An interrupted request writes a user entry with this marker text.
-			// The session is back at the prompt, so treat it as idle.
+			// When the user interrupts a response, Claude Code writes a user
+			// entry with content "[Request interrupted by user]". The session
+			// is back at the prompt, so this counts as idle.
 			if bytes.Contains(entry.Message, []byte("Request interrupted by user")) {
 				return "idle"
 			}
 			return "working"
+
 		case "progress":
+			// Hook progress events are informational; skip them and keep
+			// scanning for the actual conversational state.
 			if entry.Data.Type == "hook_progress" {
-				continue // skip hook progress, keep scanning
+				continue
 			}
 			return "working"
+
 		case "file-history-snapshot", "queue-operation":
-			continue // metadata, keep scanning
+			continue // internal bookkeeping, not conversational state
 		}
 	}
+
 	// No recognizable state entries found (e.g. brand new session with only
 	// metadata lines, or empty file) → treat as idle since it's awaiting input.
 	return "idle"
 }
 
-// padRight pads s with spaces so its display width equals targetWidth.
+// padRight pads s with trailing spaces until its terminal display width
+// equals targetWidth. Uses go-runewidth to correctly handle characters that
+// occupy more than one column (emojis, CJK characters, etc.).
 func padRight(s string, targetWidth int) string {
 	w := runewidth.StringWidth(s)
 	if w >= targetWidth {
@@ -403,11 +570,17 @@ func padRight(s string, targetWidth int) string {
 	return s + strings.Repeat(" ", targetWidth-w)
 }
 
-// formatEntries builds fzf-compatible display strings.
+// formatEntries builds fzf-compatible display strings from the resolved
+// instances. Each entry is a tab-separated line:
+//
+//	{pane_target}\t  {session}   {status}   {ago}   {elapsed}  {context}
+//
+// The pane_target is hidden from the fzf display (via --with-nth=2..) but
+// preserved in the output for switching. Columns are padded to align using
+// terminal display width rather than byte length.
 func formatEntries(instances []ClaudeInstance) []string {
 	now := time.Now()
 
-	// Compute column widths using display width (not byte length)
 	maxSession, maxStatus, maxAgo, maxElapsed := 0, 0, 0, 0
 
 	type formatted struct {
@@ -453,7 +626,8 @@ func formatEntries(instances []ClaudeInstance) []string {
 	return entries
 }
 
-// formatElapsed converts a duration to a compact string like "2h30m".
+// formatElapsed converts a duration to a compact human-readable string.
+// Examples: "<1m", "5m", "2h30m", "1d14h30m".
 func formatElapsed(d time.Duration) string {
 	days := int(d.Hours()) / 24
 	hours := int(d.Hours()) % 24
@@ -475,7 +649,8 @@ func formatElapsed(d time.Duration) string {
 	return result
 }
 
-// formatAgo converts a delta in seconds to "just now", "3m ago", etc.
+// formatAgo converts a delta in seconds to a human-readable "time ago" string.
+// Examples: "just now", "3m ago", "2h15m ago", "5d ago".
 func formatAgo(delta int64) string {
 	switch {
 	case delta < 60:
@@ -494,7 +669,9 @@ func formatAgo(delta int64) string {
 	}
 }
 
-// runFzfPicker spawns fzf-tmux and returns the selected line.
+// runFzfPicker launches fzf-tmux as a floating popup and returns the
+// user-selected line. Returns empty string and nil error if the user
+// cancels (presses Escape).
 func runFzfPicker(entries []string) (string, error) {
 	cmd := exec.Command("fzf-tmux",
 		"-p", "65%,40%",
@@ -517,7 +694,7 @@ func runFzfPicker(entries []string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// tmuxMessage displays a message in tmux.
+// tmuxMessage displays a short message in the tmux status line.
 func tmuxMessage(msg string) {
 	exec.Command("tmux", "display-message", msg).Run()
 }
