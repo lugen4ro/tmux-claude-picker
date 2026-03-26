@@ -222,17 +222,18 @@ func main() {
 	})
 
 	columns := getVisibleColumns()
-	entries := formatEntries(instances, columns)
+	entries, header := formatEntries(instances, columns)
 
 	// Debug mode: print entries to stdout instead of launching fzf.
 	if len(os.Args) > 1 && os.Args[1] == "--debug" {
+		fmt.Println(header)
 		for _, e := range entries {
 			fmt.Println(strings.Replace(e, "\t", " | ", 1))
 		}
 		return
 	}
 
-	selected, err := runFzfPicker(entries)
+	selected, err := runFzfPicker(entries, header)
 	if err != nil || selected == "" {
 		return
 	}
@@ -637,13 +638,32 @@ func getVisibleColumns() map[string]bool {
 	return cols
 }
 
+// columnDef defines a picker column: its config key, display header, and
+// the maximum display width needed across all rows (computed at format time).
+type columnDef struct {
+	key    string
+	header string
+}
+
+// allColumns defines every available column in display order.
+var allColumns = []columnDef{
+	{"session", "SESSION"},
+	{"window", "WINDOW"},
+	{"status", "STATUS"},
+	{"ago", "ATTACHED"},
+	{"elapsed", "ELAPSED"},
+	{"context", "CONTEXT"},
+}
+
 // formatEntries builds fzf-compatible display strings from the resolved
 // instances. Each entry is a tab-separated line where the pane_target is
 // hidden from the fzf display (via --with-nth=2..) but preserved in the
 // output for switching. Which columns appear is controlled by the columns
 // parameter. Columns are padded to align using terminal display width
 // rather than byte length.
-func formatEntries(instances []ClaudeInstance, columns map[string]bool) []string {
+//
+// Returns the formatted entries and a header string for fzf --header.
+func formatEntries(instances []ClaudeInstance, columns map[string]bool) ([]string, string) {
 	now := time.Now()
 
 	type formatted struct {
@@ -651,7 +671,8 @@ func formatEntries(instances []ClaudeInstance, columns map[string]bool) []string
 	}
 	rows := make([]formatted, len(instances))
 
-	maxSession, maxWindow, maxStatus, maxAgo, maxElapsed := 0, 0, 0, 0, 0
+	// Compute column values and track max widths (keyed by column key).
+	maxWidth := map[string]int{}
 
 	for i, inst := range instances {
 		ago := formatAgo(now.Unix() - inst.LastAttached)
@@ -661,50 +682,90 @@ func formatEntries(instances []ClaudeInstance, columns map[string]bool) []string
 			ctx = "[nvim]"
 		}
 
-		rows[i] = formatted{inst.SessionName, inst.WindowName, inst.Status, ago, elapsed, ctx}
+		status := formatStatus(inst.Status)
+		rows[i] = formatted{inst.SessionName, inst.WindowName, status, ago, elapsed, ctx}
 
-		if w := runewidth.StringWidth(inst.SessionName); w > maxSession {
-			maxSession = w
+		vals := map[string]string{
+			"session": inst.SessionName,
+			"window":  inst.WindowName,
+			"status":  status,
+			"ago":     ago,
+			"elapsed": elapsed,
+			"context": ctx,
 		}
-		if w := runewidth.StringWidth(inst.WindowName); w > maxWindow {
-			maxWindow = w
+		for k, v := range vals {
+			if w := runewidth.StringWidth(v); w > maxWidth[k] {
+				maxWidth[k] = w
+			}
 		}
-		if w := runewidth.StringWidth(inst.Status); w > maxStatus {
-			maxStatus = w
+	}
+
+	// Ensure header labels are accounted for in column widths.
+	for _, col := range allColumns {
+		if !columns[col.key] {
+			continue
 		}
-		if w := runewidth.StringWidth(ago); w > maxAgo {
-			maxAgo = w
+		if w := runewidth.StringWidth(col.header); w > maxWidth[col.key] {
+			maxWidth[col.key] = w
 		}
-		if w := runewidth.StringWidth(elapsed); w > maxElapsed {
-			maxElapsed = w
+	}
+
+	// Build header.
+	var headerParts []string
+	for _, col := range allColumns {
+		if !columns[col.key] {
+			continue
 		}
+		headerParts = append(headerParts, padRight(col.header, maxWidth[col.key]))
+	}
+	header := "  " + strings.Join(headerParts, "   ")
+
+	// Build entries.
+	valFor := func(r formatted, key string) string {
+		switch key {
+		case "session":
+			return r.session
+		case "window":
+			return r.window
+		case "status":
+			return r.status
+		case "ago":
+			return r.ago
+		case "elapsed":
+			return r.elapsed
+		case "context":
+			return r.context
+		}
+		return ""
 	}
 
 	entries := make([]string, len(instances))
 	for i, inst := range instances {
 		r := rows[i]
 		var parts []string
-		if columns["session"] {
-			parts = append(parts, padRight(r.session, maxSession))
-		}
-		if columns["window"] {
-			parts = append(parts, padRight(r.window, maxWindow))
-		}
-		if columns["status"] {
-			parts = append(parts, padRight(r.status, maxStatus))
-		}
-		if columns["ago"] {
-			parts = append(parts, padRight(r.ago, maxAgo))
-		}
-		if columns["elapsed"] {
-			parts = append(parts, padRight(r.elapsed, maxElapsed))
-		}
-		if columns["context"] {
-			parts = append(parts, r.context)
+		for _, col := range allColumns {
+			if !columns[col.key] {
+				continue
+			}
+			parts = append(parts, padRight(valFor(r, col.key), maxWidth[col.key]))
 		}
 		entries[i] = inst.PaneTarget + "\t  " + strings.Join(parts, "   ")
 	}
-	return entries
+	return entries, header
+}
+
+// formatStatus prepends a status emoji for quick visual scanning.
+func formatStatus(status string) string {
+	switch status {
+	case "idle":
+		return "💤 idle"
+	case "working":
+		return "🔨 working"
+	case "waiting":
+		return "⏳ waiting"
+	default:
+		return status
+	}
 }
 
 // formatElapsed converts a duration to a compact human-readable string.
@@ -753,12 +814,13 @@ func formatAgo(delta int64) string {
 // runFzfPicker launches fzf-tmux as a floating popup and returns the
 // user-selected line. Returns empty string and nil error if the user
 // cancels (presses Escape).
-func runFzfPicker(entries []string) (string, error) {
+func runFzfPicker(entries []string, header string) (string, error) {
 	cmd := exec.Command("fzf-tmux",
 		"-p", "65%,40%",
 		"--no-sort", "--ansi", "--layout=reverse",
 		"--border-label", " Claude Code ",
 		"--prompt", "🤖  ",
+		"--header", header,
 		"--color", "fg+:#cdd6f4,bg+:#45475a,hl+:#f38ba8,pointer:#f5e0dc,gutter:-1",
 		"--bind", "tab:down,btab:up",
 		"--with-nth=2..",
