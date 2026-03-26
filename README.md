@@ -2,10 +2,10 @@
 
 A tmux plugin for managing multiple Claude Code sessions. If you run Claude Code across many tmux sessions, this gives you a single picker to see all of them at a glance and jump directly to any one.
 
-Built on [fzf-tmux](https://github.com/junegunn/fzf#fzf-tmux).
+Built on [fzf-tmux](https://github.com/sainnhe/tmux-fzf).
 
 
-<img width="2606" height="1461" alt="CleanShot2026-03-25at13 20 12" src="https://github.com/user-attachments/assets/08110d13-a53e-4b07-a2a3-be60b1041322" />
+<img width="2606" height="1461" alt="CleanShot2026-03-26at11 11 26" src="https://github.com/user-attachments/assets/13ff5abd-2d5d-4a69-a390-5caf3d2f1034" />
 
 
 ## Features
