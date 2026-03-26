@@ -73,6 +73,10 @@ set -g @claude-picker-columns 'window,status'
 3. Reads the tail of each session's JSONL conversation log to determine status
 4. Presents everything in an fzf-tmux popup and switches to the selected pane
 
+## Known Limitations
+
+- **Status detection with multiple sessions in the same project directory:** Claude Code may rotate its internal session ID (e.g. after `/clear` or context compression) without updating the session file. When only one Claude instance is running in a given directory, the picker detects the new session ID automatically. However, when multiple Claude instances share the same working directory, the picker cannot reliably map rotated session IDs to specific processes, so status may show as `idle` even if the session is active.
+
 ## Acknowledgements
 
 - [fzf](https://github.com/junegunn/fzf) / [fzf-tmux](https://github.com/junegunn/fzf#fzf-tmux) — picker UI

@@ -173,6 +173,17 @@ func main() {
 	}
 
 	// Step 4: For each session, validate it's alive and map it to a tmux pane.
+	// First, count how many live sessions share each cwd so we know when
+	// it's safe to use the JSONL fallback heuristic (only with one session
+	// per cwd — with multiple sessions we can't tell which JSONL belongs
+	// to which process).
+	cwdCount := map[string]int{}
+	for _, s := range sessions {
+		if _, ok := parentOf[s.PID]; ok {
+			cwdCount[s.CWD]++
+		}
+	}
+
 	seen := map[string]bool{}
 	var instances []ClaudeInstance
 
@@ -196,6 +207,11 @@ func main() {
 		}
 		seen[pane.Target] = true
 
+		// Only use the JSONL fallback when this is the sole session for
+		// its cwd; with multiple sessions we can't reliably map a rotated
+		// session ID to a specific process.
+		allowFallback := cwdCount[s.CWD] <= 1
+
 		inst := ClaudeInstance{
 			PID:          s.PID,
 			SessionID:    s.SessionID,
@@ -206,7 +222,7 @@ func main() {
 			WindowName:   pane.Window,
 			LastAttached: pane.LastAttached,
 			InNvim:       hasNvimAncestor(s.PID, panePID, parentOf, commOf),
-			Status:       detectStatus(s.SessionID, s.CWD),
+			Status:       detectStatus(s.SessionID, s.CWD, allowFallback),
 		}
 		instances = append(instances, inst)
 	}
@@ -405,23 +421,92 @@ func hasNvimAncestor(pid, panePID int, parentOf map[int]int, commOf map[int]stri
 //
 //	cwd "/Users/foo/bar" → encoded "-Users-foo-bar"
 //
-// Returns "idle", "working", or "waiting".
-func detectStatus(sessionID, cwd string) string {
+// Returns "idle", "working", or "waiting". When allowFallback is true and
+// the exact session JSONL appears stale, detectStatus will check for a more
+// recently modified JSONL in the same project directory. This fallback is
+// only safe when there is a single Claude session for this cwd.
+func detectStatus(sessionID, cwd string, allowFallback bool) string {
 	claudeDir, err := getClaudeDir()
 	if err != nil {
 		return "idle"
 	}
 
 	encodedPath := strings.ReplaceAll(cwd, "/", "-")
-	jsonlPath := filepath.Join(claudeDir, "projects", encodedPath, sessionID+".jsonl")
+	projectDir := filepath.Join(claudeDir, "projects", encodedPath)
+
+	// Claude Code may create new session IDs during a conversation (e.g.
+	// after /clear or context compression) without updating the sessions
+	// file. When allowFallback is true and this is the only session for
+	// this cwd, try the most recently modified JSONL as a fallback.
+	jsonlPath := findActiveJSONL(projectDir, sessionID, allowFallback)
+	if jsonlPath == "" {
+		return "idle"
+	}
 
 	lines, err := readLastLines(jsonlPath, 20)
 	if err != nil {
-		// File doesn't exist yet (brand new session) → waiting for user input.
 		return "idle"
 	}
 
 	return classifyStatus(lines)
+}
+
+// findActiveJSONL returns the path to the JSONL file that best represents
+// the current conversation state. Claude Code creates new session IDs on
+// /clear or context compression without updating the sessions/{PID}.json
+// file, so the exact session ID may point to a stale log.
+//
+// Strategy: try the exact session ID first. If it exists but appears idle,
+// check whether a more recently modified JSONL exists in the same project
+// directory — if so, that's likely the continuation of the conversation.
+func findActiveJSONL(projectDir, sessionID string, allowFallback bool) string {
+	exactPath := filepath.Join(projectDir, sessionID+".jsonl")
+
+	if !allowFallback {
+		if _, err := os.Stat(exactPath); err == nil {
+			return exactPath
+		}
+		return ""
+	}
+
+	exactFi, exactErr := os.Stat(exactPath)
+
+	matches, err := filepath.Glob(filepath.Join(projectDir, "*.jsonl"))
+	if err != nil || len(matches) == 0 {
+		if exactErr == nil {
+			return exactPath
+		}
+		return ""
+	}
+
+	// Find the most recently modified JSONL file.
+	var newestPath string
+	var newestMod time.Time
+	for _, m := range matches {
+		fi, err := os.Stat(m)
+		if err != nil {
+			continue
+		}
+		if fi.ModTime().After(newestMod) {
+			newestMod = fi.ModTime()
+			newestPath = m
+		}
+	}
+
+	// If the exact file doesn't exist, use the newest.
+	if exactErr != nil {
+		return newestPath
+	}
+
+	// If the exact file is the newest, use it.
+	if !newestMod.After(exactFi.ModTime()) {
+		return exactPath
+	}
+
+	// The exact file exists but a newer one does too. Use the newer one —
+	// it's likely a continuation of the same conversation under a new
+	// session ID.
+	return newestPath
 }
 
 // readLastLines reads the last n complete lines from a file by scanning
