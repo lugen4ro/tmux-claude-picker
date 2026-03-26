@@ -221,7 +221,8 @@ func main() {
 		return instances[i].LastAttached > instances[j].LastAttached
 	})
 
-	entries := formatEntries(instances)
+	columns := getVisibleColumns()
+	entries := formatEntries(instances, columns)
 
 	// Debug mode: print entries to stdout instead of launching fzf.
 	if len(os.Args) > 1 && os.Args[1] == "--debug" {
@@ -598,23 +599,59 @@ func padRight(s string, targetWidth int) string {
 	return s + strings.Repeat(" ", targetWidth-w)
 }
 
-// formatEntries builds fzf-compatible display strings from the resolved
-// instances. Each entry is a tab-separated line:
+// getVisibleColumns reads the @claude-picker-columns tmux option to determine
+// which columns to display. The option is a comma-separated list of column
+// names. If unset, all columns are shown.
 //
-//	{pane_target}\t  {session}   {window}   {status}   {ago}   {elapsed}  {context}
+// Available columns: session, window, status, ago, elapsed, context
 //
-// The pane_target is hidden from the fzf display (via --with-nth=2..) but
-// preserved in the output for switching. Columns are padded to align using
-// terminal display width rather than byte length.
-func formatEntries(instances []ClaudeInstance) []string {
-	now := time.Now()
+// Example tmux config:
+//
+//	set -g @claude-picker-columns "window,status,elapsed"
+func getVisibleColumns() map[string]bool {
+	defaults := []string{"session", "window", "status", "ago", "elapsed", "context"}
 
-	maxSession, maxWindow, maxStatus, maxAgo, maxElapsed := 0, 0, 0, 0, 0
+	out, err := exec.Command("tmux", "show-option", "-gqv", "@claude-picker-columns").Output()
+	if err != nil {
+		// Not in tmux or option not set — show all columns.
+		cols := map[string]bool{}
+		for _, c := range defaults {
+			cols[c] = true
+		}
+		return cols
+	}
+
+	raw := strings.TrimSpace(string(out))
+	if raw == "" {
+		cols := map[string]bool{}
+		for _, c := range defaults {
+			cols[c] = true
+		}
+		return cols
+	}
+
+	cols := map[string]bool{}
+	for _, c := range strings.Split(raw, ",") {
+		cols[strings.TrimSpace(c)] = true
+	}
+	return cols
+}
+
+// formatEntries builds fzf-compatible display strings from the resolved
+// instances. Each entry is a tab-separated line where the pane_target is
+// hidden from the fzf display (via --with-nth=2..) but preserved in the
+// output for switching. Which columns appear is controlled by the columns
+// parameter. Columns are padded to align using terminal display width
+// rather than byte length.
+func formatEntries(instances []ClaudeInstance, columns map[string]bool) []string {
+	now := time.Now()
 
 	type formatted struct {
 		session, window, status, ago, elapsed, context string
 	}
 	rows := make([]formatted, len(instances))
+
+	maxSession, maxWindow, maxStatus, maxAgo, maxElapsed := 0, 0, 0, 0, 0
 
 	for i, inst := range instances {
 		ago := formatAgo(now.Unix() - inst.LastAttached)
@@ -646,14 +683,26 @@ func formatEntries(instances []ClaudeInstance) []string {
 	entries := make([]string, len(instances))
 	for i, inst := range instances {
 		r := rows[i]
-		entries[i] = fmt.Sprintf("%s\t  %s   %s   %s   %s   %s  %s",
-			inst.PaneTarget,
-			padRight(r.session, maxSession),
-			padRight(r.window, maxWindow),
-			padRight(r.status, maxStatus),
-			padRight(r.ago, maxAgo),
-			padRight(r.elapsed, maxElapsed),
-			r.context)
+		var parts []string
+		if columns["session"] {
+			parts = append(parts, padRight(r.session, maxSession))
+		}
+		if columns["window"] {
+			parts = append(parts, padRight(r.window, maxWindow))
+		}
+		if columns["status"] {
+			parts = append(parts, padRight(r.status, maxStatus))
+		}
+		if columns["ago"] {
+			parts = append(parts, padRight(r.ago, maxAgo))
+		}
+		if columns["elapsed"] {
+			parts = append(parts, padRight(r.elapsed, maxElapsed))
+		}
+		if columns["context"] {
+			parts = append(parts, r.context)
+		}
+		entries[i] = inst.PaneTarget + "\t  " + strings.Join(parts, "   ")
 	}
 	return entries
 }

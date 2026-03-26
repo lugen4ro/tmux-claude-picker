@@ -40,10 +40,30 @@ Then `prefix + I` to install via TPM. The Go binary is built automatically on fi
 
 ### Configuration
 
-Change the key binding:
+```tmux
+# Key binding (default: S, i.e. prefix + S)
+# set -g @claude-picker-key 'S'
+
+# Choose which columns to display (default: all)
+# Available columns: session, window, status, ago, elapsed, context
+set -g @claude-picker-columns 'session,window,status,ago,elapsed,context'
+```
+
+#### Columns
+
+| Column    | Description                                          |
+|-----------|------------------------------------------------------|
+| `session` | Tmux session name                                    |
+| `window`  | Tmux window name                                     |
+| `status`  | Claude Code status: `idle`, `working`, or `waiting`  |
+| `ago`     | Time since the tmux session was last attached         |
+| `elapsed` | How long the Claude Code session has been running     |
+| `context` | Extra info such as `[nvim]` for neovim-hosted sessions |
+
+All columns are shown by default. To show only specific columns, set `@claude-picker-columns` to a comma-separated list. For example, to show only window name and status:
 
 ```tmux
-set -g @claude-picker-key 'C-s'
+set -g @claude-picker-columns 'window,status'
 ```
 
 ## How It Works
