@@ -87,7 +87,7 @@
 //
 // Entries are formatted as tab-separated lines for fzf:
 //
-//	{pane_target}\t  {session_name}   {status}   {last_attached}   {elapsed}  {context}
+//	{pane_target}\t  {session}   {window}   {status}   {last_attached}   {elapsed}  {context}
 //
 // The pane_target (e.g. "mysession:0.1") is hidden from display via fzf's
 // --with-nth=2.. but used as the switch target when selected. Column widths
@@ -121,6 +121,7 @@ const (
 type PaneInfo struct {
 	Target       string // e.g. "mysession:0.1"
 	Session      string // e.g. "mysession"
+	Window       string // e.g. "editor" (tmux window name)
 	LastAttached int64  // unix timestamp of the session's last client attachment
 }
 
@@ -143,6 +144,7 @@ type ClaudeInstance struct {
 	StartedAt    time.Time
 	PaneTarget   string // tmux target for switching, e.g. "mysession:0.1"
 	SessionName  string // tmux session name for display
+	WindowName   string // tmux window name for display
 	LastAttached int64  // for sorting: most recently attached first
 	InNvim       bool   // true if Claude is running inside a neovim terminal
 	Status       string // "working", "idle", or "waiting"
@@ -201,6 +203,7 @@ func main() {
 			StartedAt:    time.UnixMilli(s.StartedAt),
 			PaneTarget:   pane.Target,
 			SessionName:  pane.Session,
+			WindowName:   pane.Window,
 			LastAttached: pane.LastAttached,
 			InNvim:       hasNvimAncestor(s.PID, panePID, parentOf, commOf),
 			Status:       detectStatus(s.SessionID, s.CWD),
@@ -241,22 +244,22 @@ func main() {
 // buildPaneLookup queries tmux for all panes across all sessions and returns
 // a map from each pane's shell PID to its metadata.
 //
-// It runs: tmux list-panes -a -F "#{pane_pid}|#{session_name}|#{window_index}|#{pane_index}|#{session_last_attached}"
+// It runs: tmux list-panes -a -F "#{pane_pid}|#{session_name}|#{window_index}|#{pane_index}|#{session_last_attached}|#{window_name}"
 //
 // The output is pipe-delimited with one line per pane, e.g.:
 //
-//	12345|mysession|0|1|1711234567
+//	12345|mysession|0|1|1711234567|editor
 func buildPaneLookup() (map[int]PaneInfo, error) {
 	out, err := exec.Command("tmux", "list-panes", "-a", "-F",
-		"#{pane_pid}|#{session_name}|#{window_index}|#{pane_index}|#{session_last_attached}").Output()
+		"#{pane_pid}|#{session_name}|#{window_index}|#{pane_index}|#{session_last_attached}|#{window_name}").Output()
 	if err != nil {
 		return nil, fmt.Errorf("tmux list-panes failed: %w", err)
 	}
 
 	lookup := map[int]PaneInfo{}
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		parts := strings.SplitN(line, "|", 5)
-		if len(parts) < 5 {
+		parts := strings.SplitN(line, "|", 6)
+		if len(parts) < 6 {
 			continue
 		}
 		pid, _ := strconv.Atoi(parts[0])
@@ -264,6 +267,7 @@ func buildPaneLookup() (map[int]PaneInfo, error) {
 		lookup[pid] = PaneInfo{
 			Target:       fmt.Sprintf("%s:%s.%s", parts[1], parts[2], parts[3]),
 			Session:      parts[1],
+			Window:       parts[5],
 			LastAttached: lastAtt,
 		}
 	}
@@ -597,7 +601,7 @@ func padRight(s string, targetWidth int) string {
 // formatEntries builds fzf-compatible display strings from the resolved
 // instances. Each entry is a tab-separated line:
 //
-//	{pane_target}\t  {session}   {status}   {ago}   {elapsed}  {context}
+//	{pane_target}\t  {session}   {window}   {status}   {ago}   {elapsed}  {context}
 //
 // The pane_target is hidden from the fzf display (via --with-nth=2..) but
 // preserved in the output for switching. Columns are padded to align using
@@ -605,10 +609,10 @@ func padRight(s string, targetWidth int) string {
 func formatEntries(instances []ClaudeInstance) []string {
 	now := time.Now()
 
-	maxSession, maxStatus, maxAgo, maxElapsed := 0, 0, 0, 0
+	maxSession, maxWindow, maxStatus, maxAgo, maxElapsed := 0, 0, 0, 0, 0
 
 	type formatted struct {
-		session, status, ago, elapsed, context string
+		session, window, status, ago, elapsed, context string
 	}
 	rows := make([]formatted, len(instances))
 
@@ -620,10 +624,13 @@ func formatEntries(instances []ClaudeInstance) []string {
 			ctx = "[nvim]"
 		}
 
-		rows[i] = formatted{inst.SessionName, inst.Status, ago, elapsed, ctx}
+		rows[i] = formatted{inst.SessionName, inst.WindowName, inst.Status, ago, elapsed, ctx}
 
 		if w := runewidth.StringWidth(inst.SessionName); w > maxSession {
 			maxSession = w
+		}
+		if w := runewidth.StringWidth(inst.WindowName); w > maxWindow {
+			maxWindow = w
 		}
 		if w := runewidth.StringWidth(inst.Status); w > maxStatus {
 			maxStatus = w
@@ -639,9 +646,10 @@ func formatEntries(instances []ClaudeInstance) []string {
 	entries := make([]string, len(instances))
 	for i, inst := range instances {
 		r := rows[i]
-		entries[i] = fmt.Sprintf("%s\t  %s   %s   %s   %s  %s",
+		entries[i] = fmt.Sprintf("%s\t  %s   %s   %s   %s   %s  %s",
 			inst.PaneTarget,
 			padRight(r.session, maxSession),
+			padRight(r.window, maxWindow),
 			padRight(r.status, maxStatus),
 			padRight(r.ago, maxAgo),
 			padRight(r.elapsed, maxElapsed),
